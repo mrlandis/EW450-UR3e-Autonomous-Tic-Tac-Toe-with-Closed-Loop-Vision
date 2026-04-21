@@ -1,0 +1,432 @@
+% main_TicTacToe.m
+clear; clc; close all;
+
+%% 1. Initialization
+disp('Waking up the UR3e arm...');
+[cam, prv] = initCamera('DFK 23U618');
+
+% Initialize Robot
+ur = URQt('UR3e');
+ur.Initialize; 
+ur.GripPosition = 0; % Start with an open hand
+disp('Success!');
+
+load(fullfile('HandheldCal', 'HandCalInfo.mat'), 'cameraParams');
+load(fullfile('RobCamCal', 'URcoCalInfo.mat'), 'H_c2o', 'H_o2c');
+load(fullfile('RobCamCal', 'SavedCalibrationPoses.mat'), 'q_saved');
+load(fullfile('RobCamCal', 'SafeRestPose.mat'), 'safeRestPose'); % <-- CUSTOM HOME
+ur.Joints = safeRestPose;
+
+% UR3e kinematics links
+L = transpose([151.85, 243.55, 213.20, 131.05, 85.35, 92.10+170]);
+
+%% 2. Game Constants
+tagFamily = 'tag36h11';
+boardTagIDs = [450, 460];     
+cpuPieceIDs = [461:465];      
+playerPieceIDs = [451:455];   
+
+tagSizeBoard = 29.0;          
+tagSizePiece = 25.0;          
+
+% Origin (0,0) is the center of the bottom-left board tag (ID 450).
+% Exact physical dimensions of the board!
+squareOffsets = [
+    12, -178, 0;   % 1 (Top Left)
+    75, -178, 0;   % 2 (Top Mid)
+    138, -178, 0;  % 3 (Top Right)
+    12, -115, 0;   % 4 (Mid Left)
+    75, -115, 0;   % 5 (Center)
+    138, -115, 0;  % 6 (Mid Right)
+    12,  -52, 0;   % 7 (Bottom Left)
+    75,  -52, 0;   % 8 (Bottom Mid)
+    138,  -52, 0   % 9 (Bottom Right)
+];
+
+% --- TUNING VARIABLES ---
+pickOffsetX = 25;   
+pickOffsetY = 20;  
+
+zHoverHeight = 100.0; % Safe clearance height for perfectly flat horizontal moves
+zOffsetGrasp = -30.0; 
+zOffsetDrop  = -20.0; 
+
+%% 3. Pre-Game Setup
+gameState = zeros(1, 9); 
+isGameOver = false;
+
+% Track unplayed CPU pieces so it never re-picks a played piece!
+unplayedCpuIDs = cpuPieceIDs; 
+
+disp('Moving to safe camera view position...');
+ur.Joints = safeRestPose;
+pause(2);
+
+disp('   WELCOME TO TIC-TAC-TOE!');
+userInput = input('Who goes first? Enter 1 for CPU, 2 for PLAYER: ');
+if userInput == 1
+    currentPlayer = 1;
+    disp('CPU ');
+else
+    currentPlayer = -1;
+    disp('Your Turn.');
+end
+
+disp('Tracking the board...');
+
+%% 4. Main Game Loop
+while ~isGameOver
+    
+    % --- PLAYER'S TURN ---
+    if currentPlayer == -1
+        disp('Waiting for you to make a move...');
+        playerMoved = false;
+        
+        while ~playerMoved
+            imDist = getsnapshot(cam); 
+            im = undistortImage(imDist, cameraParams);
+            
+            % CONSTANT VISUAL CHECK: Read pieces and board with correct scaling
+            [idPieces, ~, posePieces, ~] = readAprilTag(im, tagFamily, cameraParams, tagSizePiece);
+            [idBoard, ~, poseBoard, ~] = readAprilTag(im, tagFamily, cameraParams, tagSizeBoard);
+            
+            boardIdx = find(idBoard == boardTagIDs(1), 1);
+            if isempty(boardIdx)
+                pause(0.5); 
+                continue;
+            end
+            
+            H_board2c = poseBoard(boardIdx).T.';
+            
+            % --- LIVE VISION RADAR OVERLAY ---
+            drawBoardRadar(im, H_board2c, squareOffsets, cameraParams);
+            
+            currentState = updateBoardState(idPieces, posePieces, H_board2c, cpuPieceIDs, playerPieceIDs, squareOffsets);
+            
+            if sum(currentState == -1) > sum(gameState == -1)
+                disp('Cool, you know how to play tic-tac-toe, shocker.');
+                pause(0.1); 
+                
+                imDist = getsnapshot(cam); 
+                im = undistortImage(imDist, cameraParams);
+                
+                [idPieces, ~, posePieces, ~] = readAprilTag(im, tagFamily, cameraParams, tagSizePiece);
+                [idBoard, ~, poseBoard, ~] = readAprilTag(im, tagFamily, cameraParams, tagSizeBoard);
+                
+                boardIdx = find(idBoard == boardTagIDs(1), 1);
+                
+                if ~isempty(boardIdx)
+                    H_board2c = poseBoard(boardIdx).T.';
+                    
+                    % Update overlay
+                    drawBoardRadar(im, H_board2c, squareOffsets, cameraParams);
+                    
+                    gameState = updateBoardState(idPieces, posePieces, H_board2c, cpuPieceIDs, playerPieceIDs, squareOffsets);
+                    disp('Current Board State:');
+                    disp(reshape(gameState, 3, 3).');
+                    playerMoved = true; 
+                else
+                    disp('Move your hand, bum.');
+                end
+            else
+                pause(1.0); % Prevents camera crash
+            end
+        end
+        
+        [isGameOver, winner] = checkWinCondition(gameState);
+        if isGameOver
+            break;
+        end
+        
+        currentPlayer = 1; 
+    
+    % --- CPU'S TURN ---
+    elseif currentPlayer == 1
+        disp('CPU is calculating the optimal move... beep boop.');
+        
+        imDist = getsnapshot(cam);
+        im = undistortImage(imDist, cameraParams);
+        
+        % Correctly scale pieces vs board
+        [idPieces, ~, posePieces, ~] = readAprilTag(im, tagFamily, cameraParams, tagSizePiece);
+        [idBoard, ~, poseBoard, ~] = readAprilTag(im, tagFamily, cameraParams, tagSizeBoard);
+        
+        boardIdx = find(idBoard == boardTagIDs(1), 1);
+        if isempty(boardIdx)
+            disp('Uh oh. I can''t see my origin tag. Did someone bump the table?');
+            continue; 
+        end
+        H_board2c = poseBoard(boardIdx).T.';
+        H_board2o = H_c2o * H_board2c;
+        
+        targetSquare = calculateCPUMove(gameState);
+        
+        availablePieceIdx = findAvailablePiece(idPieces, posePieces, unplayedCpuIDs);
+        
+        if availablePieceIdx == 0
+            disp('Wait, I''m out of pieces! Please put more CPU pieces in my staging area.');
+            break;
+        end
+        
+        usedID = idPieces(availablePieceIdx);
+        unplayedCpuIDs = unplayedCpuIDs(unplayedCpuIDs ~= usedID);
+        
+        % ========================================================
+        % --- PERFECT RIGHT-ANGLE PICK AND PLACE SEQUENCE ---
+        % ========================================================
+        
+        % --- Pick ---
+        ur.GripPosition = 0; pause(0.5);
+        H_piece2c = posePieces(availablePieceIdx).T.';
+        
+        H_localOffset = eye(4);
+        H_localOffset(1, 4) = pickOffsetX;
+        H_localOffset(2, 4) = pickOffsetY;
+        H_piece2c_corrected = H_piece2c * H_localOffset;
+        
+        H_piece2o = H_c2o * H_piece2c_corrected; 
+        
+        % 1. HOVER STRAIGHT ABOVE PIECE
+        H_hoverPick = H_piece2o; 
+        H_hoverPick(3, 4) = H_hoverPick(3, 4) + zHoverHeight;
+        ur.Joints = ikinPickAndPlace(poseToTask(H_hoverPick), L); pause(2);
+        
+        % 2. GO STRAIGHT DOWN AND GRAB
+        H_graspPick = H_piece2o; 
+        H_graspPick(3, 4) = H_graspPick(3, 4) + zOffsetGrasp;
+        ur.Joints = ikinPickAndPlace(poseToTask(H_graspPick), L); pause(1.5);
+        
+        ur.GripPosition = 52; pause(1); 
+        
+        % 3. PULL STRAIGHT BACK UP TO EXACT HOVER HEIGHT
+        ur.Joints = ikinPickAndPlace(poseToTask(H_hoverPick), L); pause(1.5);
+
+        % --- Place --- 
+        targetOffset = squareOffsets(targetSquare, :);
+        H_target2board = eye(4);
+        H_target2board(1:3, 4) = targetOffset.';
+        
+        H_placeOffset = eye(4);
+        H_placeOffset(1, 4) = pickOffsetX;
+        H_placeOffset(2, 4) = pickOffsetY;
+        
+        H_target2o = H_board2o * H_target2board * H_placeOffset; 
+        
+        % 4. MOVE HORIZONTALLY (Copying the exact Z-height from the Pick Hover!)
+        H_hoverPlace = H_target2o; 
+        H_hoverPlace(3, 4) = H_hoverPick(3, 4); % <-- THIS GUARANTEES A FLAT MOVE
+        ur.Joints = ikinPickAndPlace(poseToTask(H_hoverPlace), L); pause(2);
+        
+        % 5. GO STRAIGHT DOWN AND DROP
+        H_releasePlace = H_target2o; 
+        H_releasePlace(3, 4) = H_releasePlace(3, 4) + zOffsetDrop; 
+        ur.Joints = ikinPickAndPlace(poseToTask(H_releasePlace), L); pause(1.5);
+        
+        ur.GripPosition = 0; pause(1); 
+        
+        % 6. GO STRAIGHT BACK UP
+        ur.Joints = ikinPickAndPlace(poseToTask(H_hoverPlace), L); pause(1.5);
+        
+        % ========================================================
+        
+        disp('Move completed! Retreating to safe camera view...');
+        ur.Joints = safeRestPose; % <-- CUSTOM HOME
+        pause(2);
+        
+        % --- VERIFICATION & TRUE VISION SCAN ---
+        disp('Scanning the physical board to verify the placement...');
+        
+        imDist = getsnapshot(cam);
+        im = undistortImage(imDist, cameraParams);
+        
+        [idPieces, ~, posePieces, ~] = readAprilTag(im, tagFamily, cameraParams, tagSizePiece);
+        [idBoard, ~, poseBoard, ~] = readAprilTag(im, tagFamily, cameraParams, tagSizeBoard);
+        
+        boardIdx = find(idBoard == boardTagIDs(1), 1);
+        if ~isempty(boardIdx)
+            H_board2c = poseBoard(boardIdx).T.';
+            
+            % Update overlay 
+            drawBoardRadar(im, H_board2c, squareOffsets, cameraParams);
+            
+            gameState = updateBoardState(idPieces, posePieces, H_board2c, cpuPieceIDs, playerPieceIDs, squareOffsets);
+        else
+            disp('Warning: Board tag occluded after move. State might be temporarily stale.');
+        end
+        
+        disp('Here is the TRUE board state seen by the camera:');
+        disp(reshape(gameState, 3, 3).');
+        
+        % CLOSED LOOP CHECK: Did the piece actually land in the square?
+        if gameState(targetSquare) == 1
+            disp('Move successfully verified!');
+            
+            [isGameOver, winner] = checkWinCondition(gameState);
+            if isGameOver
+                break;
+            end
+            
+            currentPlayer = -1; % Success! Pass turn to the player.
+        else
+            disp('===============================================');
+            disp('ERROR: Move failed! Piece did not land in target square.');
+            disp('Retrying move with a new piece...');
+            disp('===============================================');
+            % currentPlayer remains 1. The loop will restart and try again!
+        end
+    end
+end
+
+%% 5. Game Over Handling
+disp('=================================');
+if winner == 1
+    disp('GAME OVER: CPU Wins! Better luck next time, human!');
+elseif winner == -1
+    disp('GAME OVER: PLAYER Wins! Wow, you actually beat me. Well played.');
+else
+    disp('GAME OVER: It''s a Draw! A perfectly balanced battle of wits.');
+end
+disp('=================================');
+ur.GripPosition = 0; 
+ur.Joints = safeRestPose; % <-- CUSTOM HOME
+
+%% LOCAL HELPER FUNCTIONS
+
+% THE NEW VISUAL RADAR FUNCTION
+function drawBoardRadar(im, H_board2c, squareOffsets, cameraParams)
+    % Pop open a background figure to show the bounds
+    fig = figure(99);
+    set(fig, 'Name', 'Live Vision Radar', 'NumberTitle', 'off');
+    imshow(im); hold on;
+    
+    % Extract Rotation and Translation to project 3D points to 2D
+    R = H_board2c(1:3, 1:3);
+    t = H_board2c(1:3, 4).';
+    
+    for j = 1:9
+        cx = squareOffsets(j, 1);
+        cy = squareOffsets(j, 2);
+        
+        % Create the 4 corners of our 35mm bounding box in 3D space
+        box3D = [
+            cx-35, cy-35, 0;
+            cx+35, cy-35, 0;
+            cx+35, cy+35, 0;
+            cx-35, cy+35, 0
+        ];
+        
+        % Project the 3D corners down to 2D image pixels!
+        box2D = worldToImage(cameraParams, R, t, box3D);
+        
+        % Draw the physical boundaries
+        plot([box2D(:,1); box2D(1,1)], [box2D(:,2); box2D(1,2)], 'g-', 'LineWidth', 2);
+        
+        % Add the Square Number Tag
+        text(box2D(1,1), box2D(1,2) - 15, sprintf('Square %d', j), 'Color', 'g', 'FontSize', 12, 'FontWeight', 'bold');
+    end
+    hold off;
+    drawnow;
+end
+
+function state = updateBoardState(ids, poses, H_board2c, cpuIDs, playerIDs, squareOffsets)
+    state = zeros(1, 9);
+    H_c2board = invSE(H_board2c);
+    
+    disp('--- CAMERA RADAR ---');
+    for i = 1:length(ids)
+        currentID = ids(i);
+        isCPU = ismember(currentID, cpuIDs);
+        isPlayer = ismember(currentID, playerIDs);
+        
+        if isCPU || isPlayer
+            H_piece2c = poses(i).T.';
+            H_piece2board = H_c2board * H_piece2c;
+            piecePos = H_piece2board(1:3, 4).';
+            
+            minDist = inf;
+            closestSquare = -1;
+            for j = 1:9
+                dist = norm(piecePos(1:2) - squareOffsets(j, 1:2));
+                if dist < minDist
+                    minDist = dist;
+                    closestSquare = j;
+                end
+            end
+            
+            % TIGHTENED FROM 45, EXPANDED FROM 25. 35mm covers the 63mm physical squares safely.
+            if minDist < 35 
+                if isCPU
+                    state(closestSquare) = 1;
+                    fprintf('Radar: CPU Piece %d found at X: %6.1f, Y: %6.1f -> Mapped to Square %d\n', currentID, piecePos(1), piecePos(2), closestSquare);
+                else
+                    state(closestSquare) = -1;
+                    fprintf('Radar: PLAYER Piece %d found at X: %6.1f, Y: %6.1f -> Mapped to Square %d\n', currentID, piecePos(1), piecePos(2), closestSquare);
+                end
+            else
+                fprintf('Radar: Ignored Piece %d at X: %6.1f, Y: %6.1f (Missed Square %d by %.1f mm)\n', currentID, piecePos(1), piecePos(2), closestSquare, minDist);
+            end
+        end
+    end
+    disp('--------------------');
+end
+
+function moveIdx = calculateCPUMove(state)
+    winLines = [1 2 3; 4 5 6; 7 8 9; 1 4 7; 2 5 8; 3 6 9; 1 5 9; 3 5 7];
+    for i = 1:8
+        line = winLines(i, :);
+        if sum(state(line) == 1) == 2 && sum(state(line) == 0) == 1
+            moveIdx = line(state(line) == 0); return;
+        end
+    end
+    for i = 1:8
+        line = winLines(i, :);
+        if sum(state(line) == -1) == 2 && sum(state(line) == 0) == 1
+            moveIdx = line(state(line) == 0); return;
+        end
+    end
+    if state(5) == 0
+        moveIdx = 5; return;
+    end
+    corners = [1, 3, 7, 9];
+    availCorners = corners(state(corners) == 0);
+    if ~isempty(availCorners)
+        moveIdx = availCorners(1); return;
+    end
+    edges = [2, 4, 6, 8];
+    availEdges = edges(state(edges) == 0);
+    if ~isempty(availEdges)
+        moveIdx = availEdges(1); return;
+    end
+    emptySquares = find(state == 0);
+    moveIdx = emptySquares(1);
+end
+
+function [isOver, winner] = checkWinCondition(state)
+    winLines = [1 2 3; 4 5 6; 7 8 9; 1 4 7; 2 5 8; 3 6 9; 1 5 9; 3 5 7];
+    isOver = false; winner = 0;
+    for i = 1:8
+        lineSum = sum(state(winLines(i, :)));
+        if lineSum == 3
+            isOver = true; winner = 1; return;
+        elseif lineSum == -3
+            isOver = true; winner = -1; return;
+        end
+    end
+    if ~any(state == 0)
+        isOver = true; 
+    end
+end
+
+function targetIdx = findAvailablePiece(ids, poses, activeCpuIDs)
+    targetIdx = 0;
+    for i = 1:length(ids)
+        if ismember(ids(i), activeCpuIDs)
+            targetIdx = i; return;
+        end
+    end
+end
+
+function invH = invSE(H)
+    R = H(1:3, 1:3); d = H(1:3, 4);
+    invH = [R.', -R.'*d; 0, 0, 0, 1];
+end
