@@ -1,4 +1,4 @@
-#UR3e Autonomous Tic-Tac-Toe with Closed-Loop Vision
+UR3e Autonomous Tic-Tac-Toe with Closed-Loop Vision
 
 A fully autonomous Tic-Tac-Toe playing robot built in MATLAB using a UR3e collaborative robot arm and overhead camera vision. This project features dynamic AprilTag tracking, Augmented Reality (AR) debugging, and closed-loop error recovery, allowing the robot to play a flawless physical game against a human opponent.
 ✨ Key Features
